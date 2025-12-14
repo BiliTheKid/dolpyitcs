@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Dolpyitcs Test Page</title>
+    <script src="https://dolpyitcs.fly.dev/tracker.js"></script>
+</head>
+<body>
+    <h1>Dolpyitcs Tracker Test</h1>
+    <p>Open the browser console (F12) to see tracking events.</p>
+
+    <button onclick="testClick()">Test Click Event</button>
+    <button onclick="testCustomEvent()">Test Custom Event</button>
+
+    <a href="#section1">Test Link</a>
+
+    <div style="height: 2000px; background: linear-gradient(white, lightblue);">
+        <p>Scroll down to test scroll tracking...</p>
+    </div>
+
+    <div id="section1">
+        <h2>Section 1</h2>
+    </div>
+
+    <script>
+        function testClick() {
+            console.log('Button clicked - event should be tracked');
+        }
+
+        function testCustomEvent() {
+            if (window.dolpyitcs) {
+                dolpyitcs.track('test_event', {
+                    test: true,
+                    timestamp: new Date().toISOString()
+                });
+                console.log('Custom event sent!');
+            } else {
+                console.log('Tracker not loaded yet');
+            }
+        }
+
+        // Log when tracker is ready
+        setTimeout(() => {
+            if (window.dolpyitcs) {
+                console.log('✅ Dolpyitcs tracker loaded!');
+            } else {
+                console.log('❌ Tracker not loaded');
+            }
+        }, 1000);
+    </script>
+</body>
+</html>
