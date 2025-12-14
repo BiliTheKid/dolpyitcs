@@ -319,52 +319,41 @@ async def get_analytics(time_range: str = '7d', hostname: str = None):
         )
         unique_sessions = len(sessions_result)
 
-        # Get top pages
-        top_pages_raw = await db.event.group_by(
-            by=["path"],
+        # Get top pages using find_many and manual grouping (group_by has compatibility issues)
+        all_pageviews = await db.event.find_many(
             where={**where, "eventType": "pageview"},
-            count=True,
-            order={"_count": {"_all": "desc"}},
-            take=10
+            take=1000
         )
-        top_pages = [{"page": p.get("path") or "/", "views": p.get("_count", {}).get("_all", 0)} for p in top_pages_raw]
 
-        # Get browsers
-        browsers_raw = await db.event.group_by(
-            by=["browser"],
-            where={**where, "eventType": "pageview"},
-            count=True,
-            order={"_count": {"_all": "desc"}}
-        )
-        browsers = [{"browser": b.get("browser") or "Unknown", "count": b.get("_count", {}).get("_all", 0)} for b in browsers_raw]
+        # Manual grouping for top pages
+        page_counts = {}
+        browser_counts = {}
+        device_counts = {}
+        os_counts = {}
+        referrer_counts = {}
 
-        # Get devices
-        devices_raw = await db.event.group_by(
-            by=["deviceType"],
-            where={**where, "eventType": "pageview"},
-            count=True,
-            order={"_count": {"_all": "desc"}}
-        )
-        devices = [{"device": d.get("deviceType") or "Unknown", "count": d.get("_count", {}).get("_all", 0)} for d in devices_raw]
+        for event in all_pageviews:
+            # Pages
+            path = event.path or "/"
+            page_counts[path] = page_counts.get(path, 0) + 1
+            # Browsers
+            browser = event.browser or "Unknown"
+            browser_counts[browser] = browser_counts.get(browser, 0) + 1
+            # Devices
+            device = event.deviceType or "Unknown"
+            device_counts[device] = device_counts.get(device, 0) + 1
+            # OS
+            os_name = event.os or "Unknown"
+            os_counts[os_name] = os_counts.get(os_name, 0) + 1
+            # Referrers
+            referrer = event.referrer or "direct"
+            referrer_counts[referrer] = referrer_counts.get(referrer, 0) + 1
 
-        # Get OS
-        os_raw = await db.event.group_by(
-            by=["os"],
-            where={**where, "eventType": "pageview"},
-            count=True,
-            order={"_count": {"_all": "desc"}}
-        )
-        operating_systems = [{"os": o.get("os") or "Unknown", "count": o.get("_count", {}).get("_all", 0)} for o in os_raw]
-
-        # Get referrers
-        referrers_raw = await db.event.group_by(
-            by=["referrer"],
-            where={**where, "eventType": "pageview"},
-            count=True,
-            order={"_count": {"_all": "desc"}},
-            take=10
-        )
-        top_referrers = [{"referrer": r.get("referrer") or "direct", "count": r.get("_count", {}).get("_all", 0)} for r in referrers_raw]
+        top_pages = sorted([{"page": k, "views": v} for k, v in page_counts.items()], key=lambda x: x["views"], reverse=True)[:10]
+        browsers = sorted([{"browser": k, "count": v} for k, v in browser_counts.items()], key=lambda x: x["count"], reverse=True)
+        devices = sorted([{"device": k, "count": v} for k, v in device_counts.items()], key=lambda x: x["count"], reverse=True)
+        operating_systems = sorted([{"os": k, "count": v} for k, v in os_counts.items()], key=lambda x: x["count"], reverse=True)
+        top_referrers = sorted([{"referrer": k, "count": v} for k, v in referrer_counts.items()], key=lambda x: x["count"], reverse=True)[:10]
 
         # Get recent events
         recent_events_raw = await db.event.find_many(
@@ -403,15 +392,20 @@ async def get_analytics(time_range: str = '7d', hostname: str = None):
         except Exception as e:
             logger.warning("performance_aggregate_failed", error=str(e))
 
-        # Get errors
-        errors_raw = await db.error.group_by(
-            by=["message"],
-            where={"timestamp": {"gte": start_time}} if start_time else {},
-            count=True,
-            order={"_count": {"_all": "desc"}},
-            take=5
-        )
-        top_errors = [{"message": (e.get("message") or "")[:100], "count": e.get("_count", {}).get("_all", 0)} for e in errors_raw]
+        # Get errors using manual grouping
+        top_errors = []
+        try:
+            errors_raw = await db.error.find_many(
+                where={"timestamp": {"gte": start_time}} if start_time else {},
+                take=100
+            )
+            error_counts = {}
+            for err in errors_raw:
+                msg = (err.message or "Unknown")[:100]
+                error_counts[msg] = error_counts.get(msg, 0) + 1
+            top_errors = sorted([{"message": k, "count": v} for k, v in error_counts.items()], key=lambda x: x["count"], reverse=True)[:5]
+        except Exception as e:
+            logger.warning("errors_query_failed", error=str(e))
 
         # Total events
         total_events = await db.event.count(where=where)
