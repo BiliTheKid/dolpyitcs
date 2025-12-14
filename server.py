@@ -1,23 +1,28 @@
 """
-Dolpyitcs - Analytics Server (FastAPI)
+Dolpyitcs - Analytics Server (FastAPI + Prisma)
 Collects and stores analytics data, serves the dashboard
 """
 
-from fastapi import FastAPI, Request, Query
+from fastapi import FastAPI, Request, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
-import json
-import os
-import aiofiles
-import structlog
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
-from contextlib import asynccontextmanager
+import json
+import os
 import time
+import structlog
+from prisma import Prisma
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 
 # Configure structured logging
 structlog.configure(
     processors=[
+        structlog.contextvars.merge_contextvars,
         structlog.stdlib.filter_by_level,
         structlog.stdlib.add_logger_name,
         structlog.stdlib.add_log_level,
@@ -34,11 +39,23 @@ structlog.configure(
 
 logger = structlog.get_logger("dolpyitcs")
 
-# Metrics storage (in-memory for simplicity)
+# OpenTelemetry setup
+trace.set_tracer_provider(TracerProvider())
+tracer = trace.get_tracer(__name__)
+
+# Add console exporter for development (can add Jaeger/OTLP for production)
+span_processor = BatchSpanProcessor(ConsoleSpanExporter())
+trace.get_tracer_provider().add_span_processor(span_processor)
+
+# Prisma client
+db = Prisma()
+
+# Metrics storage (in-memory, complementing DB)
 metrics = {
     "requests_total": 0,
     "events_collected": 0,
     "errors_total": 0,
+    "db_queries": 0,
     "request_duration_seconds": [],
     "startup_time": None,
 }
@@ -52,13 +69,27 @@ def utc_now():
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     """Application lifespan events."""
+    # Startup
+    await db.connect()
     metrics["startup_time"] = utc_now().isoformat()
-    logger.info("server_started", port=PORT, pid=os.getpid())
+    logger.info("server_started", port=PORT, pid=os.getpid(), database="connected")
+
     yield
-    logger.info("server_stopped")
+
+    # Shutdown
+    await db.disconnect()
+    logger.info("server_stopped", database="disconnected")
 
 
-app = FastAPI(title="Dolpyitcs Analytics", lifespan=lifespan)
+app = FastAPI(
+    title="Dolpyitcs Analytics",
+    description="Privacy-friendly analytics platform",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# Instrument FastAPI with OpenTelemetry
+FastAPIInstrumentor.instrument_app(app)
 
 # CORS middleware
 app.add_middleware(
@@ -72,15 +103,20 @@ app.add_middleware(
 # Request logging middleware
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    """Log all requests with timing."""
+    """Log all requests with timing and tracing."""
     start_time = time.time()
+    request_id = request.headers.get("X-Request-ID", f"req_{int(time.time() * 1000)}")
+
+    # Bind request context to logger
+    structlog.contextvars.clear_contextvars()
+    structlog.contextvars.bind_contextvars(request_id=request_id)
+
     metrics["requests_total"] += 1
 
     response = await call_next(request)
 
     duration = time.time() - start_time
     metrics["request_duration_seconds"].append(duration)
-    # Keep only last 1000 durations
     if len(metrics["request_duration_seconds"]) > 1000:
         metrics["request_duration_seconds"] = metrics["request_duration_seconds"][-1000:]
 
@@ -93,227 +129,317 @@ async def log_requests(request: Request, call_next):
         client_ip=request.client.host if request.client else None,
     )
 
+    response.headers["X-Request-ID"] = request_id
     return response
+
 
 PORT = int(os.environ.get('PORT', 3000))
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.environ.get('DATA_DIR', BASE_DIR)
-DATA_FILE = os.path.join(DATA_DIR, 'analytics_data.json')
 
 
-async def load_data():
-    """Load analytics data from file."""
-    if not os.path.exists(DATA_FILE):
-        return {'events': []}
-    try:
-        async with aiofiles.open(DATA_FILE, 'r', encoding='utf-8') as f:
-            content = await f.read()
-            return json.loads(content)
-    except (json.JSONDecodeError, IOError):
-        return {'events': []}
+# Database operations
+async def save_event(event_data: dict) -> str:
+    """Save an event to the database."""
+    with tracer.start_as_current_span("save_event") as span:
+        span.set_attribute("event.type", event_data.get("eventType", "unknown"))
 
+        metrics["db_queries"] += 1
 
-async def save_data(data):
-    """Save analytics data to file."""
-    async with aiofiles.open(DATA_FILE, 'w', encoding='utf-8') as f:
-        await f.write(json.dumps(data, indent=2))
-
-
-async def add_event(event):
-    """Add a new event to the data store."""
-    data = await load_data()
-    event['receivedAt'] = utc_now().isoformat().replace('+00:00', 'Z')
-    data['events'].append(event)
-    metrics["events_collected"] += 1
-    logger.debug("event_added", event_type=event.get('eventType'))
-
-    # Keep only last 100,000 events
-    if len(data['events']) > 100000:
-        data['events'] = data['events'][-100000:]
-
-    await save_data(data)
-
-
-async def get_analytics(time_range='7d'):
-    """Calculate analytics metrics for the given time range."""
-    data = await load_data()
-    now = utc_now().replace(tzinfo=None)  # Remove timezone for comparison
-
-    # Calculate time range
-    ranges = {
-        '24h': timedelta(hours=24),
-        '7d': timedelta(days=7),
-        '30d': timedelta(days=30),
-        'all': None
-    }
-
-    range_delta = ranges.get(time_range, ranges['7d'])
-
-    # Filter events by time range
-    events = []
-    for e in data['events']:
-        try:
-            event_time = datetime.fromisoformat(e.get('timestamp', '').replace('Z', ''))
-            if range_delta is None or (now - event_time) <= range_delta:
-                events.append(e)
-        except (ValueError, TypeError):
-            continue
-
-    # Calculate metrics
-    pageviews = [e for e in events if e.get('eventType') == 'pageview']
-    unique_visitors = len(set(e.get('visitorId') for e in events if e.get('visitorId')))
-    unique_sessions = len(set(e.get('sessionId') for e in events if e.get('sessionId')))
-
-    # Pages breakdown
-    pages_counts = defaultdict(int)
-    for e in pageviews:
-        page = e.get('path', '/')
-        pages_counts[page] += 1
-    top_pages = sorted(pages_counts.items(), key=lambda x: x[1], reverse=True)[:10]
-    top_pages = [{'page': p, 'views': v} for p, v in top_pages]
-
-    # Referrers breakdown
-    referrer_counts = defaultdict(int)
-    for e in pageviews:
-        ref = e.get('referrer', 'direct')
-        if ref and ref != 'direct':
+        # Parse timestamp
+        timestamp = event_data.get("timestamp")
+        if isinstance(timestamp, str):
             try:
-                from urllib.parse import urlparse
-                ref = urlparse(ref).hostname or 'unknown'
-            except Exception:
-                ref = 'unknown'
-        referrer_counts[ref] += 1
-    top_referrers = sorted(referrer_counts.items(), key=lambda x: x[1], reverse=True)[:10]
-    top_referrers = [{'referrer': r, 'count': c} for r, c in top_referrers]
+                timestamp = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+            except ValueError:
+                timestamp = utc_now()
+        else:
+            timestamp = utc_now()
 
-    # Browsers breakdown
-    browser_counts = defaultdict(int)
-    for e in pageviews:
-        browser = e.get('browser', 'Unknown')
-        browser_counts[browser] += 1
-    browsers = sorted(browser_counts.items(), key=lambda x: x[1], reverse=True)
-    browsers = [{'browser': b, 'count': c} for b, c in browsers]
+        # Create event in database
+        event = await db.event.create(
+            data={
+                "eventType": event_data.get("eventType", "unknown"),
+                "visitorId": event_data.get("visitorId", ""),
+                "sessionId": event_data.get("sessionId", ""),
+                "timestamp": timestamp,
+                "url": event_data.get("url"),
+                "path": event_data.get("path"),
+                "hostname": event_data.get("hostname"),
+                "referrer": event_data.get("referrer"),
+                "title": event_data.get("title"),
+                "browser": event_data.get("browser"),
+                "os": event_data.get("os"),
+                "deviceType": event_data.get("deviceType"),
+                "userAgent": event_data.get("userAgent"),
+                "screenWidth": event_data.get("screenWidth"),
+                "screenHeight": event_data.get("screenHeight"),
+                "viewportWidth": event_data.get("viewportWidth"),
+                "viewportHeight": event_data.get("viewportHeight"),
+                "colorDepth": event_data.get("colorDepth"),
+                "language": event_data.get("language"),
+                "timezone": event_data.get("timezone"),
+                "timezoneOffset": event_data.get("timezoneOffset"),
+                "ip": event_data.get("ip"),
+                "data": json.dumps(event_data) if event_data else None,
+            }
+        )
 
-    # OS breakdown
-    os_counts = defaultdict(int)
-    for e in pageviews:
-        os_name = e.get('os', 'Unknown')
-        os_counts[os_name] += 1
-    operating_systems = sorted(os_counts.items(), key=lambda x: x[1], reverse=True)
-    operating_systems = [{'os': o, 'count': c} for o, c in operating_systems]
+        # Update visitor record
+        await db.visitor.upsert(
+            where={"visitorId": event_data.get("visitorId", "")},
+            data={
+                "create": {
+                    "visitorId": event_data.get("visitorId", ""),
+                    "totalEvents": 1,
+                },
+                "update": {
+                    "lastSeen": utc_now(),
+                    "totalEvents": {"increment": 1},
+                },
+            }
+        )
 
-    # Device types breakdown
-    device_counts = defaultdict(int)
-    for e in pageviews:
-        device = e.get('deviceType', 'Unknown')
-        device_counts[device] += 1
-    devices = sorted(device_counts.items(), key=lambda x: x[1], reverse=True)
-    devices = [{'device': d, 'count': c} for d, c in devices]
+        # Update session record
+        await db.session.upsert(
+            where={"sessionId": event_data.get("sessionId", "")},
+            data={
+                "create": {
+                    "sessionId": event_data.get("sessionId", ""),
+                    "visitorId": event_data.get("visitorId", ""),
+                    "entryPage": event_data.get("path"),
+                    "browser": event_data.get("browser"),
+                    "os": event_data.get("os"),
+                    "deviceType": event_data.get("deviceType"),
+                    "pageviews": 1 if event_data.get("eventType") == "pageview" else 0,
+                    "events": 1,
+                },
+                "update": {
+                    "endedAt": utc_now(),
+                    "exitPage": event_data.get("path"),
+                    "pageviews": {"increment": 1 if event_data.get("eventType") == "pageview" else 0},
+                    "events": {"increment": 1},
+                },
+            }
+        )
 
-    # Timezones breakdown
-    timezone_counts = defaultdict(int)
-    for e in pageviews:
-        tz = e.get('timezone', 'Unknown')
-        timezone_counts[tz] += 1
-    timezones = sorted(timezone_counts.items(), key=lambda x: x[1], reverse=True)[:10]
-    timezones = [{'timezone': t, 'count': c} for t, c in timezones]
+        # Save performance data if present
+        if event_data.get("eventType") == "performance" and event_data.get("performance"):
+            perf = event_data["performance"]
+            await db.pageperformance.create(
+                data={
+                    "eventId": event.id,
+                    "path": event_data.get("path", "/"),
+                    "timestamp": timestamp,
+                    "pageLoadTime": perf.get("pageLoadTime"),
+                    "domContentLoaded": perf.get("domContentLoaded"),
+                    "firstByte": perf.get("firstByte"),
+                    "dnsLookup": perf.get("dnsLookup"),
+                    "tcpConnect": perf.get("tcpConnect"),
+                }
+            )
 
-    # Pageviews over time (daily)
-    daily_views = defaultdict(int)
-    for e in pageviews:
-        try:
-            date = e.get('timestamp', '')[:10]
-            if date:
-                daily_views[date] += 1
-        except Exception:
-            continue
-    views_over_time = sorted(daily_views.items())
-    views_over_time = [{'date': d, 'views': v} for d, v in views_over_time]
+        # Save error data if present
+        if event_data.get("eventType") == "error":
+            await db.error.create(
+                data={
+                    "eventId": event.id,
+                    "visitorId": event_data.get("visitorId", ""),
+                    "sessionId": event_data.get("sessionId", ""),
+                    "timestamp": timestamp,
+                    "message": event_data.get("message", "Unknown error"),
+                    "source": event_data.get("source"),
+                    "line": event_data.get("line"),
+                    "column": event_data.get("colno"),
+                    "stack": event_data.get("stack"),
+                    "path": event_data.get("path"),
+                    "browser": event_data.get("browser"),
+                    "os": event_data.get("os"),
+                }
+            )
 
-    # Average time on page
-    time_on_page_events = [e for e in events if e.get('eventType') == 'time_on_page']
-    avg_time_on_page = 0
-    if time_on_page_events:
-        total_time = sum(e.get('timeOnPage', 0) for e in time_on_page_events)
-        avg_time_on_page = round(total_time / len(time_on_page_events))
+        metrics["events_collected"] += 1
+        logger.debug("event_saved", event_id=event.id, event_type=event_data.get("eventType"))
 
-    # Average scroll depth
-    scroll_events = [e for e in events if e.get('eventType') == 'scroll_depth']
-    avg_scroll_depth = 0
-    if scroll_events:
-        total_scroll = sum(e.get('maxScrollDepth', 0) for e in scroll_events)
-        avg_scroll_depth = round(total_scroll / len(scroll_events))
+        return event.id
 
-    # Click events
-    click_events = [e for e in events if e.get('eventType') == 'click']
-    click_counts = defaultdict(int)
-    for e in click_events:
-        key = e.get('elementText') or e.get('elementId') or e.get('href') or 'Unknown'
-        click_counts[key] += 1
-    top_clicks = sorted(click_counts.items(), key=lambda x: x[1], reverse=True)[:10]
-    top_clicks = [{'element': el[:50], 'clicks': c} for el, c in top_clicks]
 
-    # Errors
-    errors = [e for e in events if e.get('eventType') == 'error']
-    error_counts = defaultdict(int)
-    for e in errors:
-        msg = e.get('message', 'Unknown error')
-        error_counts[msg] += 1
-    top_errors = sorted(error_counts.items(), key=lambda x: x[1], reverse=True)[:5]
-    top_errors = [{'message': m[:100], 'count': c} for m, c in top_errors]
+async def get_analytics(time_range: str = '7d', hostname: str = None):
+    """Get analytics data from database."""
+    with tracer.start_as_current_span("get_analytics") as span:
+        span.set_attribute("time_range", time_range)
 
-    # Performance metrics
-    perf_events = [e for e in events if e.get('eventType') == 'performance' and e.get('performance')]
-    avg_performance = None
-    if perf_events:
-        avg_performance = {
-            'pageLoadTime': round(sum(e['performance'].get('pageLoadTime', 0) for e in perf_events) / len(perf_events)),
-            'domContentLoaded': round(sum(e['performance'].get('domContentLoaded', 0) for e in perf_events) / len(perf_events)),
-            'firstByte': round(sum(e['performance'].get('firstByte', 0) for e in perf_events) / len(perf_events))
+        metrics["db_queries"] += 1
+        now = utc_now()
+
+        # Calculate time range
+        ranges = {
+            '24h': timedelta(hours=24),
+            '7d': timedelta(days=7),
+            '30d': timedelta(days=30),
+            'all': None
         }
+        range_delta = ranges.get(time_range, ranges['7d'])
 
-    # Recent events
-    recent_events = []
-    for e in events[-20:][::-1]:
-        recent_events.append({
-            'type': e.get('eventType'),
-            'path': e.get('path'),
-            'timestamp': e.get('timestamp'),
-            'visitorId': (e.get('visitorId') or '')[:10],
-            'browser': e.get('browser'),
-            'device': e.get('deviceType')
-        })
+        start_time = (now - range_delta) if range_delta else None
 
-    return {
-        'summary': {
-            'totalPageviews': len(pageviews),
-            'uniqueVisitors': unique_visitors,
-            'uniqueSessions': unique_sessions,
-            'avgTimeOnPage': avg_time_on_page,
-            'avgScrollDepth': avg_scroll_depth,
-            'totalEvents': len(events)
-        },
-        'topPages': top_pages,
-        'topReferrers': top_referrers,
-        'browsers': browsers,
-        'operatingSystems': operating_systems,
-        'devices': devices,
-        'timezones': timezones,
-        'viewsOverTime': views_over_time,
-        'topClicks': top_clicks,
-        'topErrors': top_errors,
-        'avgPerformance': avg_performance,
-        'recentEvents': recent_events
-    }
+        # Build where clause
+        where = {}
+        if start_time:
+            where["timestamp"] = {"gte": start_time}
+        if hostname:
+            where["hostname"] = hostname
+
+        # Get pageviews
+        pageviews = await db.event.count(
+            where={**where, "eventType": "pageview"}
+        )
+
+        # Get unique visitors
+        visitors_result = await db.event.find_many(
+            where=where,
+            distinct=["visitorId"]
+        )
+        unique_visitors = len(visitors_result)
+
+        # Get unique sessions
+        sessions_result = await db.event.find_many(
+            where=where,
+            distinct=["sessionId"]
+        )
+        unique_sessions = len(sessions_result)
+
+        # Get top pages
+        top_pages_raw = await db.event.group_by(
+            by=["path"],
+            where={**where, "eventType": "pageview"},
+            count=True,
+            order={"_count": {"path": "desc"}},
+            take=10
+        )
+        top_pages = [{"page": p["path"] or "/", "views": p["_count"]["path"]} for p in top_pages_raw]
+
+        # Get browsers
+        browsers_raw = await db.event.group_by(
+            by=["browser"],
+            where={**where, "eventType": "pageview"},
+            count=True,
+            order={"_count": {"browser": "desc"}}
+        )
+        browsers = [{"browser": b["browser"] or "Unknown", "count": b["_count"]["browser"]} for b in browsers_raw]
+
+        # Get devices
+        devices_raw = await db.event.group_by(
+            by=["deviceType"],
+            where={**where, "eventType": "pageview"},
+            count=True,
+            order={"_count": {"deviceType": "desc"}}
+        )
+        devices = [{"device": d["deviceType"] or "Unknown", "count": d["_count"]["deviceType"]} for d in devices_raw]
+
+        # Get OS
+        os_raw = await db.event.group_by(
+            by=["os"],
+            where={**where, "eventType": "pageview"},
+            count=True,
+            order={"_count": {"os": "desc"}}
+        )
+        operating_systems = [{"os": o["os"] or "Unknown", "count": o["_count"]["os"]} for o in os_raw]
+
+        # Get referrers
+        referrers_raw = await db.event.group_by(
+            by=["referrer"],
+            where={**where, "eventType": "pageview"},
+            count=True,
+            order={"_count": {"referrer": "desc"}},
+            take=10
+        )
+        top_referrers = [{"referrer": r["referrer"] or "direct", "count": r["_count"]["referrer"]} for r in referrers_raw]
+
+        # Get recent events
+        recent_events_raw = await db.event.find_many(
+            where=where,
+            order={"timestamp": "desc"},
+            take=20
+        )
+        recent_events = [
+            {
+                "type": e.eventType,
+                "path": e.path,
+                "timestamp": e.timestamp.isoformat() if e.timestamp else None,
+                "visitorId": e.visitorId[:10] if e.visitorId else "",
+                "browser": e.browser,
+                "device": e.deviceType,
+            }
+            for e in recent_events_raw
+        ]
+
+        # Get average performance
+        perf_data = await db.pageperformance.aggregate(
+            where={"timestamp": {"gte": start_time}} if start_time else {},
+            _avg={
+                "pageLoadTime": True,
+                "domContentLoaded": True,
+                "firstByte": True,
+            }
+        )
+        avg_performance = None
+        if perf_data and perf_data._avg:
+            avg_performance = {
+                "pageLoadTime": round(perf_data._avg.get("pageLoadTime") or 0),
+                "domContentLoaded": round(perf_data._avg.get("domContentLoaded") or 0),
+                "firstByte": round(perf_data._avg.get("firstByte") or 0),
+            }
+
+        # Get errors
+        errors_raw = await db.error.group_by(
+            by=["message"],
+            where={"timestamp": {"gte": start_time}} if start_time else {},
+            count=True,
+            order={"_count": {"message": "desc"}},
+            take=5
+        )
+        top_errors = [{"message": e["message"][:100], "count": e["_count"]["message"]} for e in errors_raw]
+
+        # Total events
+        total_events = await db.event.count(where=where)
+
+        return {
+            "summary": {
+                "totalPageviews": pageviews,
+                "uniqueVisitors": unique_visitors,
+                "uniqueSessions": unique_sessions,
+                "totalEvents": total_events,
+                "avgTimeOnPage": 0,  # TODO: Calculate from session data
+                "avgScrollDepth": 0,  # TODO: Calculate from events
+            },
+            "topPages": top_pages,
+            "topReferrers": top_referrers,
+            "browsers": browsers,
+            "operatingSystems": operating_systems,
+            "devices": devices,
+            "timezones": [],  # TODO: Add timezone grouping
+            "viewsOverTime": [],  # TODO: Add time series data
+            "topClicks": [],  # TODO: Add click tracking
+            "topErrors": top_errors,
+            "avgPerformance": avg_performance,
+            "recentEvents": recent_events,
+        }
 
 
 # Routes
 
 @app.get("/api/analytics")
-async def analytics_endpoint(range: str = Query(default="7d")):
+async def analytics_endpoint(
+    range: str = Query(default="7d", description="Time range: 24h, 7d, 30d, all"),
+    hostname: str = Query(default=None, description="Filter by hostname")
+):
     """Get analytics data."""
-    analytics = await get_analytics(range)
-    return analytics
+    try:
+        analytics = await get_analytics(range, hostname)
+        return analytics
+    except Exception as e:
+        logger.error("analytics_error", error=str(e))
+        raise HTTPException(status_code=500, detail="Failed to fetch analytics")
 
 
 @app.get("/tracker.js")
@@ -322,7 +448,9 @@ async def serve_tracker():
     tracker_path = os.path.join(BASE_DIR, 'public', 'tracker.js')
     if not os.path.exists(tracker_path):
         tracker_path = os.path.join(BASE_DIR, 'tracker.js')
-    return FileResponse(tracker_path, media_type='application/javascript')
+    if os.path.exists(tracker_path):
+        return FileResponse(tracker_path, media_type='application/javascript')
+    raise HTTPException(status_code=404, detail="Tracker not found")
 
 
 @app.get("/")
@@ -341,38 +469,64 @@ async def collect_event(request: Request):
     try:
         event = await request.json()
         # Add IP address
-        event['ip'] = request.headers.get('X-Forwarded-For', request.client.host)
-        await add_event(event)
-        return {"success": True}
+        event['ip'] = request.headers.get('X-Forwarded-For', request.client.host if request.client else None)
+
+        # Save to database
+        event_id = await save_event(event)
+
+        return {"success": True, "eventId": event_id}
     except json.JSONDecodeError:
         metrics["errors_total"] += 1
         logger.warning("invalid_json_received", client_ip=request.client.host if request.client else None)
         return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+    except Exception as e:
+        metrics["errors_total"] += 1
+        logger.error("collect_error", error=str(e))
+        return JSONResponse({"error": "Failed to save event"}, status_code=500)
 
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint for monitoring."""
+    db_status = "connected" if db.is_connected() else "disconnected"
     return {
-        "status": "healthy",
+        "status": "healthy" if db_status == "connected" else "degraded",
         "timestamp": utc_now().isoformat(),
-        "version": "1.0.0"
+        "version": "1.0.0",
+        "database": db_status,
     }
 
 
 @app.get("/metrics")
-async def get_metrics():
+async def get_metrics_endpoint():
     """Prometheus-style metrics endpoint."""
     avg_duration = 0
     if metrics["request_duration_seconds"]:
         avg_duration = sum(metrics["request_duration_seconds"]) / len(metrics["request_duration_seconds"])
 
+    # Get database stats
+    total_events = 0
+    total_visitors = 0
+    total_sessions = 0
+    try:
+        total_events = await db.event.count()
+        total_visitors = await db.visitor.count()
+        total_sessions = await db.session.count()
+    except Exception:
+        pass
+
     return {
         "requests_total": metrics["requests_total"],
         "events_collected": metrics["events_collected"],
         "errors_total": metrics["errors_total"],
+        "db_queries": metrics["db_queries"],
         "avg_request_duration_ms": round(avg_duration * 1000, 2),
         "uptime_since": metrics["startup_time"],
+        "database": {
+            "total_events": total_events,
+            "total_visitors": total_visitors,
+            "total_sessions": total_sessions,
+        }
     }
 
 
@@ -387,9 +541,10 @@ if __name__ == '__main__':
 ║  Tracker script:    http://localhost:{PORT}/tracker.js      ║
 ║  API endpoint:      http://localhost:{PORT}/api/analytics   ║
 ║  API docs:          http://localhost:{PORT}/docs            ║
+║  Health check:      http://localhost:{PORT}/health          ║
+║  Metrics:           http://localhost:{PORT}/metrics         ║
 ╚═══════════════════════════════════════════════════════════╝
 
-Add this to your website's <head>:
-<script src="http://localhost:{PORT}/tracker.js"></script>
+Make sure DATABASE_URL is set in your environment!
     """)
     uvicorn.run(app, host="0.0.0.0", port=PORT)

@@ -17,10 +17,6 @@ primary_region = "iad"  # US East - change to your preferred region
   min_machines_running = 0
 
 [[vm]]
-  memory = "256mb"
+  memory = "512mb"
   cpu_kind = "shared"
   cpus = 1
-
-[mounts]
-  source = "dolpyitcs_data"
-  destination = "/data"

@@ -1,0 +1,167 @@
+// Prisma schema for Dolpyitcs Analytics
+
+generator client {
+  provider             = "prisma-client-py"
+  interface            = "asyncio"
+  recursive_type_depth = 5
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Analytics Events
+model Event {
+  id          String   @id @default(cuid())
+  eventType   String   @map("event_type")
+  visitorId   String   @map("visitor_id")
+  sessionId   String   @map("session_id")
+  timestamp   DateTime
+  receivedAt  DateTime @default(now()) @map("received_at")
+
+  // Page info
+  url         String?
+  path        String?
+  hostname    String?
+  referrer    String?
+  title       String?
+
+  // Device info
+  browser     String?
+  os          String?
+  deviceType  String?  @map("device_type")
+  userAgent   String?  @map("user_agent")
+
+  // Screen info
+  screenWidth    Int?  @map("screen_width")
+  screenHeight   Int?  @map("screen_height")
+  viewportWidth  Int?  @map("viewport_width")
+  viewportHeight Int?  @map("viewport_height")
+  colorDepth     Int?  @map("color_depth")
+
+  // Location info
+  language       String?
+  timezone       String?
+  timezoneOffset Int?    @map("timezone_offset")
+  ip             String?
+  country        String?
+  city           String?
+
+  // Event-specific data (JSON for flexibility)
+  data        Json?
+
+  // Indexes for common queries
+  @@index([eventType])
+  @@index([visitorId])
+  @@index([sessionId])
+  @@index([timestamp])
+  @@index([path])
+  @@index([hostname])
+
+  @@map("events")
+}
+
+// Visitors (for unique visitor tracking)
+model Visitor {
+  id          String    @id @default(cuid())
+  visitorId   String    @unique @map("visitor_id")
+  userId      String?   @map("user_id")  // If identified
+  firstSeen   DateTime  @default(now()) @map("first_seen")
+  lastSeen    DateTime  @default(now()) @map("last_seen")
+  totalEvents Int       @default(0) @map("total_events")
+  traits      Json?     // Custom user traits
+
+  @@map("visitors")
+}
+
+// Sessions
+model Session {
+  id          String    @id @default(cuid())
+  sessionId   String    @unique @map("session_id")
+  visitorId   String    @map("visitor_id")
+  startedAt   DateTime  @default(now()) @map("started_at")
+  endedAt     DateTime? @map("ended_at")
+  duration    Int?      // In seconds
+  pageviews   Int       @default(0)
+  events      Int       @default(0)
+
+  // Entry/exit pages
+  entryPage   String?   @map("entry_page")
+  exitPage    String?   @map("exit_page")
+
+  // Device info (snapshot)
+  browser     String?
+  os          String?
+  deviceType  String?   @map("device_type")
+
+  // Location
+  country     String?
+  city        String?
+
+  @@index([visitorId])
+  @@index([startedAt])
+
+  @@map("sessions")
+}
+
+// Page Performance metrics
+model PagePerformance {
+  id                 String   @id @default(cuid())
+  eventId            String   @map("event_id")
+  path               String
+  timestamp          DateTime
+
+  pageLoadTime       Int?     @map("page_load_time")
+  domContentLoaded   Int?     @map("dom_content_loaded")
+  firstByte          Int?     @map("first_byte")
+  dnsLookup          Int?     @map("dns_lookup")
+  tcpConnect         Int?     @map("tcp_connect")
+
+  @@index([path])
+  @@index([timestamp])
+
+  @@map("page_performance")
+}
+
+// Errors tracking
+model Error {
+  id          String   @id @default(cuid())
+  eventId     String   @map("event_id")
+  visitorId   String   @map("visitor_id")
+  sessionId   String   @map("session_id")
+  timestamp   DateTime
+
+  message     String
+  source      String?
+  line        Int?
+  column      Int?
+  stack       String?
+
+  path        String?
+  browser     String?
+  os          String?
+
+  @@index([timestamp])
+  @@index([message])
+
+  @@map("errors")
+}
+
+// Daily aggregates (for fast dashboard queries)
+model DailyStats {
+  id              String   @id @default(cuid())
+  date            DateTime @db.Date
+  hostname        String?
+
+  pageviews       Int      @default(0)
+  uniqueVisitors  Int      @default(0) @map("unique_visitors")
+  sessions        Int      @default(0)
+  avgSessionDuration Int?  @map("avg_session_duration")
+  bounceRate      Float?   @map("bounce_rate")
+
+  @@unique([date, hostname])
+  @@index([date])
+
+  @@map("daily_stats")
+}
