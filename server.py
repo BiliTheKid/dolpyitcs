@@ -69,15 +69,26 @@ def utc_now():
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     """Application lifespan events."""
-    # Startup
-    await db.connect()
+    # Startup - try to connect to database, but don't fail if it's not available
+    db_status = "disconnected"
+    try:
+        await db.connect()
+        db_status = "connected"
+    except Exception as e:
+        logger.error("database_connection_failed", error=str(e))
+        db_status = f"failed: {str(e)[:50]}"
+
     metrics["startup_time"] = utc_now().isoformat()
-    logger.info("server_started", port=PORT, pid=os.getpid(), database="connected")
+    logger.info("server_started", port=PORT, pid=os.getpid(), database=db_status)
 
     yield
 
     # Shutdown
-    await db.disconnect()
+    try:
+        if db.is_connected():
+            await db.disconnect()
+    except Exception:
+        pass
     logger.info("server_stopped", database="disconnected")
 
 
