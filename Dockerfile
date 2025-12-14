@@ -34,4 +34,4 @@ EXPOSE 8080
 
 # Run database migrations and start server
 # Use shell form to allow || fallback if db push fails
-CMD sh -c "npx prisma db push --skip-generate || echo 'DB push failed, continuing...' && uvicorn server:app --host 0.0.0.0 --port 8080"
+CMD sh -c "npx prisma db push || echo 'DB push failed, continuing...' && uvicorn server:app --host 0.0.0.0 --port 8080"
