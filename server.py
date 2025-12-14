@@ -312,48 +312,48 @@ async def get_analytics(time_range: str = '7d', hostname: str = None):
         top_pages_raw = await db.event.group_by(
             by=["path"],
             where={**where, "eventType": "pageview"},
-            count=True,
+            count={"path": True},
             order={"_count": {"path": "desc"}},
             take=10
         )
-        top_pages = [{"page": p["path"] or "/", "views": p["_count"]["path"]} for p in top_pages_raw]
+        top_pages = [{"page": getattr(p, "path", None) or "/", "views": getattr(p, "_count", {}).get("path", 0)} for p in top_pages_raw]
 
         # Get browsers
         browsers_raw = await db.event.group_by(
             by=["browser"],
             where={**where, "eventType": "pageview"},
-            count=True,
+            count={"browser": True},
             order={"_count": {"browser": "desc"}}
         )
-        browsers = [{"browser": b["browser"] or "Unknown", "count": b["_count"]["browser"]} for b in browsers_raw]
+        browsers = [{"browser": getattr(b, "browser", None) or "Unknown", "count": getattr(b, "_count", {}).get("browser", 0)} for b in browsers_raw]
 
         # Get devices
         devices_raw = await db.event.group_by(
             by=["deviceType"],
             where={**where, "eventType": "pageview"},
-            count=True,
+            count={"deviceType": True},
             order={"_count": {"deviceType": "desc"}}
         )
-        devices = [{"device": d["deviceType"] or "Unknown", "count": d["_count"]["deviceType"]} for d in devices_raw]
+        devices = [{"device": getattr(d, "deviceType", None) or "Unknown", "count": getattr(d, "_count", {}).get("deviceType", 0)} for d in devices_raw]
 
         # Get OS
         os_raw = await db.event.group_by(
             by=["os"],
             where={**where, "eventType": "pageview"},
-            count=True,
+            count={"os": True},
             order={"_count": {"os": "desc"}}
         )
-        operating_systems = [{"os": o["os"] or "Unknown", "count": o["_count"]["os"]} for o in os_raw]
+        operating_systems = [{"os": getattr(o, "os", None) or "Unknown", "count": getattr(o, "_count", {}).get("os", 0)} for o in os_raw]
 
         # Get referrers
         referrers_raw = await db.event.group_by(
             by=["referrer"],
             where={**where, "eventType": "pageview"},
-            count=True,
+            count={"referrer": True},
             order={"_count": {"referrer": "desc"}},
             take=10
         )
-        top_referrers = [{"referrer": r["referrer"] or "direct", "count": r["_count"]["referrer"]} for r in referrers_raw]
+        top_referrers = [{"referrer": getattr(r, "referrer", None) or "direct", "count": getattr(r, "_count", {}).get("referrer", 0)} for r in referrers_raw]
 
         # Get recent events
         recent_events_raw = await db.event.find_many(
@@ -384,21 +384,22 @@ async def get_analytics(time_range: str = '7d', hostname: str = None):
         )
         avg_performance = None
         if perf_data and perf_data._avg:
+            avg_obj = perf_data._avg
             avg_performance = {
-                "pageLoadTime": round(perf_data._avg.get("pageLoadTime") or 0),
-                "domContentLoaded": round(perf_data._avg.get("domContentLoaded") or 0),
-                "firstByte": round(perf_data._avg.get("firstByte") or 0),
+                "pageLoadTime": round(getattr(avg_obj, "pageLoadTime", None) or 0),
+                "domContentLoaded": round(getattr(avg_obj, "domContentLoaded", None) or 0),
+                "firstByte": round(getattr(avg_obj, "firstByte", None) or 0),
             }
 
         # Get errors
         errors_raw = await db.error.group_by(
             by=["message"],
             where={"timestamp": {"gte": start_time}} if start_time else {},
-            count=True,
+            count={"message": True},
             order={"_count": {"message": "desc"}},
             take=5
         )
-        top_errors = [{"message": e["message"][:100], "count": e["_count"]["message"]} for e in errors_raw]
+        top_errors = [{"message": (getattr(e, "message", "") or "")[:100], "count": getattr(e, "_count", {}).get("message", 0)} for e in errors_raw]
 
         # Total events
         total_events = await db.event.count(where=where)
